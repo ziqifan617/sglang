@@ -18,12 +18,13 @@ implementations or weights.
 - Size sparse checkpoint capacity according to the checkpoint grid instead of
   reserving one large state object for every KV page. The byte budget remains
   per rank; rounding includes the final partial checkpoint interval.
-- Optionally restore selected object spans directly from a peer into registered
-  HBM, with per-layer readiness, destination-descriptor reuse, chunking, a bounded
-  in-flight operation window, and preparation/assembly/submission/completion
-  counters. A layer is ready only after all contributing requests and chunks
-  complete. Submission/entry failures drain already submitted operations before
-  reporting terminal load failure.
+- Optionally restore whole objects directly from a peer into registered HBM,
+  with destination-descriptor reuse and page chunking. The direct path now
+  completes reads into private slots **before** publishing a radix-tree hit.
+  All attention ranks must agree on allocation and read success; a normal
+  source miss frees only drained, unpublished slots and recomputes.
+- A direct HBM restore is not a local KVCR DRAM deposit. Keep restored nodes
+  eligible for write-through so a later worker can fetch them from this worker.
 
 The companion KVCR branch is `ai-dynamo/kvcr:codex/linker-hybrid-followup`, based
 on `idhanani/framework-gpu-regions`. It adds a disjoint-layout eviction index,
@@ -41,20 +42,20 @@ endpoints, memory registration and per-rank budgets. Add these fields to
 ```json
 {
   "direct_remote_restore": true,
-  "progressive_remote_restore": true,
   "direct_remote_descriptor_cache": true,
-  "direct_remote_chunk_pages": 128,
-  "direct_remote_inflight_layers": 4
+  "fetch_chunk_pages": 32
 }
 ```
 
 This JSON is an **addition**, not a complete launch configuration.
 `direct_remote_restore` defaults to false: the existing claimed target-DRAM
-staging path remains the default. Chunk/window zero means unbounded within the
-admitted batch; the window counts delivery operations, including page chunks,
-despite its historical `inflight_layers` name. A page here is one pool object
-key, not necessarily one physical buffer or one token. Set
-`progressive_remote_restore=false` for a wait-for-all control run.
+staging path remains the default. A page here is one pool object key, not
+necessarily one physical buffer or one token. `progressive_remote_restore`,
+`direct_remote_chunk_pages`, and `direct_remote_inflight_layers` are retained
+for legacy configuration compatibility but are not used by the precommit path.
+Progressive transfer/compute overlap is intentionally disabled for unreserved
+direct reads; the startup log explicitly reports this. Staged restore behavior
+is unchanged.
 
 Direct restore charges ALL_PAGES pools for the whole prefix and TRAILING_PAGES
 pools only for their required tail. Lookup still intersects valid resume
@@ -62,16 +63,24 @@ boundaries, including sparse checkpoint gaps.
 
 ## Safety and review limits
 
-This is an opt-in prototype. Query is advisory; there is **no reservation/lease
-spanning query, admission and every layer's delivery**. KVCR protects sources
-while each submitted operation reads them, but eviction before a later operation
-claims its source can still cause failure. After admission that is a fatal layer
-counter error, not a silent miss or recompute fallback. Keep this disabled for
-production until a source-reservation protocol and its failure lifecycle are
-reviewed. Destination storage must remain alive until all submitted DMA drains.
+Query remains advisory; there is **no reservation/lease spanning lookup and
+delivery**. KVCR protects sources while each submitted operation reads them.
+If a source was evicted, has not finished offloading, or only holds the prefix
+in HBM, a drained precommit read can return a miss before admission. It never
+publishes partially populated slots. A native transfer with uncertain DMA, an
+owner-thread failure, or a read that does not drain is still fatal, not a safe
+recompute case: destination storage must remain owned until quiescence.
 
-Both endpoints need the companion named-span delivery support. An older source
-does not understand the subset protocol and will reject a partial layout.
+The correctness gate blocks scheduler admission and waits for all layers.
+Recovering progressive overlap requires a reviewed source reservation API and
+its cancellation/expiry lifecycle; bypassing the gate restores the old race.
+The old failure was reproducible as A -> B -> C: B received the prefix directly
+in HBM, was incorrectly marked externally stored, and skipped its own DRAM
+deposit. C then trusted a hint naming B and failed after publishing its slots.
+
+The precommit path transfers whole object layouts rather than layer subsets.
+The earlier per-layer ablation required both endpoints to support named-span
+subset delivery; its helpers remain for isolated protocol regression tests.
 Mamba external-linker MTP draft pools remain explicitly unsupported. The new
 Mamba assembly uses the current branch's transfer-entry iterator rather than
 copying the older benchmark snapshot's memory-pool implementation.

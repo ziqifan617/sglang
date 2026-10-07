@@ -47,25 +47,21 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     # False routes restores through KVCR deliver and completes all layers at
     # the end.
     direct_restore: bool = True
-    # Experimental ablation: do not prefetch hinted objects into target DRAM.
-    # After lookup allocates device pages, pull selected object spans directly
-    # from the hinted peer into HBM and release each logical layer separately.
+    # Do not prefetch hinted objects into target DRAM. Read directly into
+    # private HBM slots and confirm all bytes before publishing a radix hit;
+    # advisory hints alone cannot safely admit progressive, unreserved reads.
     direct_remote_restore: bool = False
-    # Ablation switch for direct peer-to-HBM restores. When False, all layer
-    # transfers are still issued concurrently, but the model is released only
-    # after every layer has completed.
+    # Legacy ablation switches retained for configuration compatibility.
+    # The safe precommit direct path does not use progressive layer release,
+    # per-layer windows, or per-layer chunk sizing (it uses fetch_chunk_pages).
     progressive_remote_restore: bool = True
     # Destination descriptors are stable for the lifetime of the registered
     # HBM pools. Cache them by physical pool and row so repeated restores do
     # not rebuild thousands of MemDescriptor objects on the critical path.
     direct_remote_descriptor_cache: bool = True
-    # Maximum direct peer-to-HBM layer operations in flight. Zero submits all
-    # layers at once; one prioritizes layers strictly in model execution order.
+    # Legacy per-layer operation window; not used by precommit direct reads.
     direct_remote_inflight_layers: int = 0
-    # Maximum page objects in one direct peer-to-HBM KVCR deliver. Large
-    # prefixes can otherwise create a single NIXL transfer with thousands of
-    # descriptors, which some UCX paths do not make progress on. Zero keeps
-    # one operation per grouped layer regardless of its page count.
+    # Legacy per-layer chunk size; not used by precommit direct reads.
     direct_remote_chunk_pages: int = 0
     # Direct restores submit one copy batch per model layer so the forward
     # pass can start on layer 0 early; consecutive layers whose operands total

@@ -564,14 +564,96 @@ def test_direct_peer_path_also_restores_locally_resident_objects(harness):
         h.linker.lookup("local-peer", h.lookup_transfers(hashes, swa_window=2))[-1] == 4
     )
     assert h.public_claims() == 0
-    index = h.load("local-peer", hashes, first_page=8, swa_tail=2)
-    assert h.wait_loads(1) == [["local-peer"]]
-    h.linker.layer_done_counter.set_consumer(index)
-    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    assert h.linker.requires_precommit_load
+    assert not h.linker.loaded_pages_are_stored
+    transfers = [
+        PoolTransfer(
+            name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 4)
+        ),
+        PoolTransfer(
+            name=PoolName.SWA,
+            keys=hashes[-2:],
+            device_indices=h.page_indices(10, 2),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        ),
+    ]
+    assert h.linker.load_before_commit("local-peer", transfers)
+    assert h.linker.num_completed_loads() == 0
+    assert h.linker.start_layer_wise_loading() == -1
     restored = h.snapshot(8, 4)
     for name in ("k", "v"):
         for got, want in zip(restored[name], expected[name]):
             assert torch.equal(got, want)
+
+
+def test_direct_read_cannot_queue_into_published_slots(harness):
+    h = harness(extra={"direct_remote_restore": True})
+    with pytest.raises(RuntimeError, match="load_before_commit"):
+        h.linker.load("unreserved", [])
+
+
+def test_direct_precommit_missing_source_is_a_safe_miss(harness):
+    from kvcr.types import QueryStatus
+
+    h = harness(extra={"direct_remote_restore": True})
+    hashes = _hashes("stale-source", 2)
+    # Simulate stale advisory metadata without inventing source residency.
+    h.linker._resident_pages[str(PoolName.KV)].update(hashes)
+    with patch.object(
+        h.linker._kvcr, "query", return_value=[(QueryStatus.FETCHABLE, None)] * 2
+    ):
+        h.wait_ready(h.prepare("stale", hashes))
+    assert h.linker.lookup("stale", h.lookup_transfers(hashes)) == [1, 2]
+    before = h.snapshot(8, 2)
+    assert not h.linker.load_before_commit(
+        "stale",
+        [
+            PoolTransfer(
+                name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 2)
+            )
+        ],
+    )
+    assert h.linker._unhealthy is None
+    assert h.linker.snapshot_stats()["precommit_misses"] == 1
+    assert h.linker.snapshot_stats()["kvcr_pending_ops"] == 0
+    assert h.linker.num_completed_loads() == 0
+    for name, layers in before.items():
+        for got, want in zip(h.snapshot(8, 2)[name], layers):
+            assert torch.equal(got, want)
+    # A subsequent ordinary offload/load still works; the worker stays usable.
+    h.fill(0, 2, seed=93)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("next", hashes))
+    assert h.linker.load_before_commit(
+        "next",
+        [
+            PoolTransfer(
+                name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 2)
+            )
+        ],
+    )
+
+
+def test_direct_precommit_uncertain_dma_is_not_a_recomputable_miss(harness):
+    from kvcr.types import TransferError
+
+    h = harness(extra={"direct_remote_restore": True})
+    hashes = _hashes("uncertain", 1)
+    h.fill(0, 1, seed=94)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("uncertain", hashes))
+    h.linker._on_resilience_event(TransferError("test", 100, state="uncertain"))
+    with pytest.raises(RuntimeError, match="slots must stay owned"):
+        h.linker.load_before_commit(
+            "uncertain",
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 1)
+                )
+            ],
+        )
 
 
 def test_direct_restore_layer_lands_before_later_layers(harness):
