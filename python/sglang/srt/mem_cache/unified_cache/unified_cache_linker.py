@@ -82,6 +82,21 @@ class UnifiedCacheLinker(ABC):
     # Whether offload commits publish EXTERNAL-tier KV events and evictions
     # withdraw them; only a backend that reports evictions may set this.
     publishes_external_events: bool = False
+    # An advisory lookup without a source lease must finish the actual read
+    # into private slots before those slots become visible in the radix tree.
+    requires_precommit_load: bool = False
+    # A remote read need not populate this worker's externally serveable tier.
+    # Such a backend must still offload the restored pages on this worker.
+    loaded_pages_are_stored: bool = True
+
+    def load_before_commit(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Populate unpublished device slots, returning False for a safe miss.
+
+        False guarantees no transfer can still access the destinations. An
+        uncertain DMA or owner failure must raise instead: callers must not
+        free or publish those slots. No component PREPARE hooks have run yet.
+        """
+        raise NotImplementedError
 
     def prepare_request(
         self, context: LinkerRequestContext, transfers: list[PoolTransfer]
@@ -119,6 +134,10 @@ class UnifiedCacheLinker(ABC):
         let the tree pick a length that is invalid on another rank.
 
         Local to this rank; the tree intersects the sets across ranks.
+
+        A backend with ``requires_precommit_load`` may return advisory
+        candidates here. The wrapper confirms their bytes and intersects
+        success across ranks before publishing any restored tree nodes.
         """
 
     @abstractmethod
@@ -400,23 +419,49 @@ class UnifiedCacheLinkerWrapper:
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
         # Build per-component linker transfers.
+        preloaded = self.cache_linker.requires_precommit_load
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
+                break
+            component_transfers.append((component, transfer))
+
+        allocated = len(component_transfers) == len(self._components)
+        if preloaded and cache._attn_groups_reduce:
+            # Allocation can fail on just one rank. It must still participate
+            # in the decision, rather than strand peers at the read reduction.
+            success = torch.tensor([int(allocated)], dtype=torch.int)
+            cache._all_reduce_attn_groups(success, torch.distributed.ReduceOp.MIN)
+            allocated = bool(success.item())
+        if not allocated:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+            return empty_indices, req.last_node
+
+        full_transfer = component_transfers[0][1]
+        assert full_transfer.name == PoolName.KV
+        if preloaded:
+            loaded = self.cache_linker.load_before_commit(
+                req.rid, [transfer for _, transfer in component_transfers]
+            )
+            if cache._attn_groups_reduce:
+                # A miss on any attention rank means every rank recomputes.
+                success = torch.tensor([int(loaded)], dtype=torch.int)
+                cache._all_reduce_attn_groups(success, torch.distributed.ReduceOp.MIN)
+                loaded = bool(success.item())
+            if not loaded:
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
                     req,
                     component_transfers,
                     prefix_len,
                 )
+                self.cache_linker.release_request(req.rid)
                 return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
-
-        full_transfer = component_transfers[0][1]
-        assert full_transfer.name == PoolName.KV
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -486,11 +531,13 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        if not preloaded:
+            self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        cache.tree_core.mark_external_cache_stored_path(
-            insert_result.last_device_node, req.last_node
-        )
+        if self.cache_linker.loaded_pages_are_stored:
+            cache.tree_core.mark_external_cache_stored_path(
+                insert_result.last_device_node, req.last_node
+            )
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(

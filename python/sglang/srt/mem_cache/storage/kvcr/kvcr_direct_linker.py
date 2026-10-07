@@ -7,11 +7,15 @@ Ownership model
   and reads snapshots under ``_lock``; it never touches the KVCR core.
 * One owner thread (``KVCRAdapter``) performs every KVCR call, polls
   completions, and runs deadline/deferred-submission tickers.
-* A source hint is never a hit. ``prepare_request`` queries KVCR and issues
+* In staged mode, a source hint is never a hit. ``prepare_request`` queries KVCR and issues
   ``fetch`` for useful candidates, which acquires residency claims; ``lookup``
   then exposes only pages whose claims are held. Claims live until the page is
   delivered to the GPU (or the request is released), so a lookup result cannot
   be evicted underneath the load.
+* Direct remote mode has no source lease. Its lookup is advisory; the wrapper
+  calls ``load_before_commit`` to finish NIXL delivery into unpublished HBM
+  before inserting a tree hit. A quiescent source miss recomputes. Restored HBM
+  is not local DRAM residency and remains eligible for write-through offload.
 """
 
 from __future__ import annotations
@@ -377,6 +381,8 @@ class _LoadBatch:
         "handles",
         "next_handle",
         "layer_outstanding",
+        "precommit_done",
+        "error",
     )
 
     def __init__(
@@ -399,6 +405,8 @@ class _LoadBatch:
         self.handles: list[tuple[list[int], Any]] = []
         self.next_handle = 0
         self.layer_outstanding: dict[int, int] = {}
+        self.precommit_done: Optional[threading.Event] = None
+        self.error: Optional[BaseException] = None
 
 
 class _OffloadTask:
@@ -553,6 +561,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.config = KVCRLinkerConfig.from_extra_config(extra_config)
+        self.requires_precommit_load = self.config.direct_remote_restore
+        self.loaded_pages_are_stored = not self.config.direct_remote_restore
+        # Never recycle destinations after a transfer with unproven quiescence.
+        self._uncertain_transfer_error: Optional[BaseException] = None
         if self.config.gil_switch_interval_ms is not None:
             # Process-wide: the owner thread and the scheduler share this
             # interpreter, and the default 5 ms slice is long against a
@@ -946,6 +958,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if self.config.direct_remote_restore
             else "nixl_peer_to_dram_then_local_restore",
         )
+        if self.requires_precommit_load:
+            logger.warning(
+                "KVCR direct remote reads are confirmed before radix-tree commit; "
+                "progressive_remote_restore is not used without source leases. "
+                "Restored HBM pages remain eligible for local DRAM offload."
+            )
 
     # ------------------------------------------------------------------
     # Keys and descriptors
@@ -1214,10 +1232,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             )
         limit = min(limit, max_pages)
         if self.config.direct_remote_restore:
-            # This experimental path deliberately leaves bytes at the peer
-            # until device slots exist. Query is only an advisory lookup; the
-            # later deliver remains authoritative and fails the layer counter
-            # if any advertised object disappeared before the pull.
+            # Query is advisory, not a residency claim. The wrapper must use
+            # load_before_commit once private device slots exist; only a
+            # completed delivery can turn these candidates into a tree hit.
             with self._lock:
                 if limit <= 0:
                     self._finish_preparation_locked(prep, reason="no_candidates")
@@ -1547,7 +1564,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     # Load: claims -> deliver into adopted GPU indices
     # ------------------------------------------------------------------
 
-    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+    def load(
+        self, rid: str, transfers: list[PoolTransfer], *, _precommit: bool = False
+    ) -> bool:
+        if self.requires_precommit_load and not _precommit:
+            raise RuntimeError("Direct KVCR reads require load_before_commit.")
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -1617,6 +1638,91 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 (len(pool.page_hashes) for pool in pools), default=0
             )
         return True
+
+    def load_before_commit(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Read directly into unpublished HBM; safely miss if the source is gone.
+
+        No target DRAM staging is introduced. Until KVCR offers a source lease,
+        this synchronous gate deliberately trades progressive overlap for safe
+        admission. Component PREPARE/COMMIT and tree publication happen later.
+        """
+        assert self.requires_precommit_load
+        if not self.load(rid, transfers, _precommit=True):
+            return False
+        with self._lock:
+            pools = self._pending_loads.pop(rid)
+        batch = _LoadBatch(-1, [rid], pools, _ready_event())
+        batch.precommit_done = threading.Event()
+        batch.bytes = sum(
+            len(pool.page_hashes) * self.layouts[pool.pool].object_bytes
+            for pool in pools
+        )
+        batch.requested_at = self._load_requested_at.pop(rid, batch.started_at)
+        with self._lock:
+            self.stats["load_batches"] += 1
+            self.stats["precommit_loads"] += 1
+        self._adapter.post(
+            lambda adapter: self._defer(
+                batch.ready_event, lambda: self._submit_precommit_load(batch)
+            )
+        )
+        deadline = time.monotonic() + self.config.operation_timeout_ms / 1000.0
+        while not batch.precommit_done.wait(timeout=0.01):
+            self._adapter.raise_if_failed()
+            if self._uncertain_transfer_error is not None:
+                raise RuntimeError(
+                    "KVCR precommit DMA is uncertain; device slots must stay owned"
+                ) from self._uncertain_transfer_error
+            if time.monotonic() >= deadline:
+                # Never return False on timeout: DMA may still own these slots.
+                raise RuntimeError(
+                    "KVCR precommit read did not drain; device slots must stay owned"
+                )
+        if self._uncertain_transfer_error is not None:
+            raise RuntimeError(
+                "KVCR precommit DMA is uncertain; device slots must stay owned"
+            ) from self._uncertain_transfer_error
+        if batch.error is not None:
+            raise RuntimeError("KVCR precommit submission failed") from batch.error
+        return batch.success
+
+    def _submit_precommit_load(self, batch: _LoadBatch) -> None:
+        """Copy complete objects; no layer is exposed before all reads finish."""
+        batch.submit_at = time.monotonic()
+        try:
+            operations = []
+            pool_rows = self._rows_for_pools(
+                [(pool.pool, pool.indices) for pool in batch.pools]
+            )
+            for pool, rows in zip(batch.pools, pool_rows):
+                if len(rows) != len(pool.page_hashes):
+                    raise RuntimeError("KVCR precommit page/index count mismatch")
+                chunk = self.config.fetch_chunk_pages
+                for start in range(0, len(rows), chunk):
+                    blocks = {
+                        self._key(page, pool.pool): list(
+                            self._direct_remote_page_descriptors(pool.pool, row)
+                        )
+                        for page, row in zip(
+                            pool.page_hashes[start : start + chunk],
+                            rows[start : start + chunk],
+                        )
+                    }
+                    operations.append((pool.request_id, blocks))
+            for request_id, blocks in operations:
+                op = self._adapter.kvcr.deliver(blocks, request_id=request_id)
+                batch.outstanding += 1
+                self._adapter.track(op, self._load_completion(batch, list(blocks)))
+            with self._lock:
+                self.stats["restore_direct_remote_batches"] += 1
+                self.stats["restore_direct_remote_operations"] += len(operations)
+        except Exception as error:
+            # Retain any submitted operations and wait for their completions.
+            batch.success = False
+            batch.error = error
+            logger.exception("KVCR precommit read submission failed")
+        if batch.outstanding == 0:
+            self._finish_load(batch)
 
     def cancel_queued_load(self, rid: str) -> bool:
         # The tree already published the destination indices; dropping the
@@ -1996,7 +2102,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     logger.debug("KVCR discard_hint failed", exc_info=True)
         claims = [claim for pool in batch.pools for claim in pool.claims]
         if batch.success and error is None:
-            self.layer_done_counter.complete_all(batch.counter_index)
+            if batch.precommit_done is None:
+                self.layer_done_counter.complete_all(batch.counter_index)
             submit_at = batch.submit_at or batch.started_at
             with self._lock:
                 self.stats["restored_pages"] += max(
@@ -2018,6 +2125,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     now - submit_at,
                     now - batch.requested_at,
                 )
+        elif batch.precommit_done is not None:
+            # Private slots have not been published and all submitted reads
+            # have completed. A normal absent-source failure can recompute.
+            # An uncertain native transfer is separately fatal at the gate.
+            batch.error = batch.error or error
+            with self._lock:
+                self.stats["precommit_misses"] += 1
+                self._hinted_rids.difference_update(batch.rids)
         else:
             # After admission a failed transfer is not a miss: the tree already
             # exposes the destination slots. Fail the counter so the worker stops
@@ -2031,8 +2146,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 "KVCR linker GPU load failed; worker must stop", exc_info=error
             )
         self._release_handles(claims)
-        with self._lock:
-            self._completed_loads.append(batch.rids)
+        if batch.precommit_done is not None:
+            batch.precommit_done.set()
+        else:
+            with self._lock:
+                self._completed_loads.append(batch.rids)
 
     # ------------------------------------------------------------------
     # Offload: GPU pages -> KVCR DRAM through deposit
@@ -2220,6 +2338,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _on_resilience_event(self, error: Exception) -> None:
         with self._lock:
             self.stats["resilience_events"] += 1
+            if getattr(error, "state", None) == "uncertain":
+                self._uncertain_transfer_error = error
         logger.warning("KVCR resilience event: %s", error)
 
     def _on_unhealthy(self, error: BaseException) -> None:
