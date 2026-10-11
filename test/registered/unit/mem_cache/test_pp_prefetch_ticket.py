@@ -30,11 +30,12 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -247,9 +248,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.free.assert_called_once_with(kv, pool=PoolName.KV)
         c.page_get_func = Mock(return_value=1)
         c.storage_backend = Mock()
+        c.storage_backend.prefetch_batch_pages = 1
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
-            patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
             patch.object(
                 c.storage_stop_event, "is_set", side_effect=[False, False, True]
             ),
