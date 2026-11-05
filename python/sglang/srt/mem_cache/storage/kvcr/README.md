@@ -61,6 +61,51 @@ provided by the companion in-process Dynamo SGLang integration. A query is
 advisory; terminal delivery determines which pages are usable. Missing hints
 do not authorize fetching from an unrelated replica.
 
+Move hints require `"enable_move_hint": true` and a KVCR version that supports
+move advice (tested against KVCR revision `419ac8b`). The default remains copy.
+A move first copy-fetches every required physical layout into the receiver's
+KVCR storage and holds its claims through local host-page delivery. Only pages
+complete in every required pool of this rank are re-fetched with move advice.
+Those pinned local hits request source invalidation; the receiver releases the
+claims afterward and keeps the cached data. Move enables combined KV/indexer
+reads even when `combine_page_reads` is false. Keys the receiver cannot retain or
+deliver locally fall back to ordinary copy delivery into the same host pages,
+without invalidation. Terminal local-delivery failures release their fetch claims
+first, allowing a delayed invalidation to drain before the copy retry.
+Capacity rejection therefore does not reduce restore coverage relative to a copy
+read with the same source availability. KVCR `419ac8b` rejects both fetch and
+direct delivery while a receiver key is pending removal; fallback cannot bypass
+that barrier if another operation still holds it. A page moves only if every required component was retained and
+delivered.
+Hybrid restores hold copies under
+the controller's operation scope across KV batches and trailing-state delivery;
+they invalidate only after the confirmed prefix and checkpoints are all local.
+Cancellation, scope replacement and errors release the held claims. Trailing
+pools without a confirmed operation scope use copy-only behavior.
+A scoped restore that uses copy fallback stays copy-only for the entire scope.
+If the controller trims an already-confirmed prefix head, the scope still expects
+that head and safely leaves the source intact; trimmed scopes do not commit moves.
+
+TP and CP ranks move independently. If ranks diverge, a logical KVCR page can become
+unusable on both workers even though each moved shard reached its destination.
+The controller's cross-rank completion reduction never admits a partial page;
+the request recomputes and unclaimed leftover shards become eligible for KVCR
+LRU eviction under pressure. This is a recoverable cache miss, not a bound of
+one recomputation over the page's lifetime. Cross-rank confirmation after the
+controller's reduction is a follow-up. Shared replicated MLA storage remains
+unsupported for move because another rank may still need the source pages.
+
+Move applies to KVCR-owned host storage. Source GPU and HiCache cache entries
+remain governed by SGLang's existing cache policy; this option neither evicts
+them nor marks them relinquished. A later framework backup can recreate the
+source's KVCR copy.
+
+In that KVCR revision, invalidation is per physical key and has no deletion
+acknowledgment. The adapter's copy/pin/deliver phase closes the within-rank
+partial-pool loss window before requesting invalidation. Lost invalidation can
+leave both workers with a copy. It provides no cross-rank commit protocol,
+crash durability, or framework-wide stale-GPU relinquish guard.
+
 For backend-owned routing inventory, opt in with `"publish_inventory": true`
 in the backend extra configuration and configure a ZMQ KV-event publisher
 with `"format": "dynamo"` when using Dynamo routing.
@@ -69,6 +114,11 @@ stores/removals carry `ownership="kvcr"`. A logical page is advertised after
 all required physical pools and attention shards own it, and withdrawn when
 any required shard/pool removes it. Trailing/checkpoint admission is still
 verified by the storage query and terminal read.
+Existing prefetch metadata also lets retained move reads publish destination
+Stored events; ordinary copy delivery retains no KV/indexer data to advertise.
+With `diagnostic_telemetry`, request/rank move records report complete local
+pages, failed pages and requested invalidations. Requested invalidation does
+not acknowledge source removal; observe the published ownership events too.
 
 The companion Dynamo integration requires its KV state-agent host, started
 with `DYN_NAMESPACE=<worker-namespace> python -m dynamo.kv_state_agent` before

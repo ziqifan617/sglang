@@ -31,13 +31,15 @@ def _storage_hashes(hashes: list[int], mapping: dict, keys) -> list[int]:
     return list(dict.fromkeys(translated))
 
 
-def peer_hint(extra_info, offset: int, keys=None) -> dict | None:
+def peer_hint(extra_info, offset: int, keys=None, allow_move=False) -> dict | None:
     """Validate the supported action and select this rank's source endpoint.
 
     Dynamo advertises the TP/CP/PP-zero endpoint of the chosen DP replica.
     Neighbor ports represent the other shards in that same replica.
     Namespaced storage pages use a different hash seed from router events;
     translate only through the framework's request-local full-key binding.
+    Move actions are ignored unless the backend opted in: a move read must
+    retain the pages here before the source may drop its copy.
     """
     if extra_info is None or not extra_info.extra_info:
         return None
@@ -56,7 +58,10 @@ def peer_hint(extra_info, offset: int, keys=None) -> dict | None:
         ):
             continue
         payload = action.get("payload")
-        if not isinstance(payload, dict) or payload.get("mode", "copy") != "copy":
+        if not isinstance(payload, dict):
+            continue
+        mode = payload.get("mode", "copy")
+        if mode != "copy" and not (mode == "move" and allow_move):
             continue
         if "no_retain" in payload:
             continue
@@ -85,7 +90,7 @@ def peer_hint(extra_info, offset: int, keys=None) -> dict | None:
                     "payload": {
                         "source_control_endpoint": selected_endpoint,
                         "block_hashes": hashes,
-                        "mode": "copy",
+                        "mode": mode,
                     },
                 }
             ],
