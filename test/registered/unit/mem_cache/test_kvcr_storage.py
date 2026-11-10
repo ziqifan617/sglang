@@ -19,7 +19,9 @@ from unittest.mock import patch
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockStored
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
@@ -224,6 +226,128 @@ class _StrictPeerTransport(_CopyTransport):
                 # Remove its local copy only after the final claim releases.
                 self.storage.pop(key, None)
             released.append((handle, key is not None))
+        return released
+
+
+class _RetainedMoveTransport(_StrictPeerTransport):
+    """Dependency model with destructive moves and controlled pool failures."""
+
+    def __init__(self, layouts, peers):
+        super().__init__(layouts, peers)
+        self.fail_pool = None
+        self.raise_pool = None
+        self.reject_keys = set()
+        self.inventory = None
+        self.on_move = None
+        self.invalidate_before_delivery = set()
+        self.pending_removal = set()
+        self.moves = []
+        self.named_source = None
+        # Background retention completions withheld until finish_follows().
+        self.hold_follows = False
+        self.held = {}
+
+    def _authorized(self, request_id):
+        if request_id is None and self.named_source is not None:
+            # A named-source fetch reads the source's KVCR without a request hint.
+            return dict(self.peers.get(self.named_source, {}))
+        return super()._authorized(request_id)
+
+    def finish_follows(self):
+        for handle, (result, successful) in self.held.items():
+            self.completed[handle] = result
+            if self.inventory is not None:
+                self.inventory.update(SimpleNamespace(keys=successful, removed=False))
+        self.held.clear()
+
+    def deliver(self, blocks, request_id=None):
+        if request_id is None:
+            self.pending_removal.update(self.invalidate_before_delivery)
+            self.invalidate_before_delivery.clear()
+        handle = super().deliver(
+            {k: refs for k, refs in blocks.items() if k not in self.pending_removal},
+            request_id,
+        )
+        self.completed[handle].update(
+            {
+                k: SimpleNamespace(success=False)
+                for k in blocks
+                if k in self.pending_removal
+            }
+        )
+        return handle
+
+    def fetch(
+        self,
+        keys,
+        request_id=None,
+        expected_layout=None,
+        *,
+        source_endpoint=None,
+        move=False,
+    ):
+        if any(key.decode().endswith("#" + str(self.raise_pool)) for key in keys):
+            raise RuntimeError("pool fetch failed")
+        follow = source_endpoint is not None and not move
+        if follow:
+            # A reverse move can mark receiver keys for removal before retention.
+            self.pending_removal.update(self.invalidate_before_delivery)
+            self.invalidate_before_delivery.clear()
+        accepted = [
+            k
+            for k in keys
+            if k not in self.reject_keys
+            and k not in self.pending_removal
+            and not k.decode().endswith("#" + str(self.fail_pool))
+        ]
+        self.named_source = source_endpoint
+        try:
+            handle = super().fetch(accepted, request_id, expected_layout)
+        finally:
+            self.named_source = None
+        result = self.completed[handle]
+        result.update(
+            {
+                k: SimpleNamespace(success=False, release_handle=None)
+                for k in keys
+                if k not in result
+            }
+        )
+        successful = [key for key, entry in result.items() if entry.success]
+        if follow and self.hold_follows:
+            self.held[handle] = (self.completed.pop(handle), successful)
+            return handle
+        if self.inventory is not None:
+            self.inventory.update(SimpleNamespace(keys=successful, removed=False))
+        if move:
+            # A named-source move of complete local copies invalidates the source.
+            self.moves.append((source_endpoint, tuple(keys), request_id))
+            peer = self.peers[source_endpoint]
+            for key in successful:
+                peer.pop(key, None)
+            if self.on_move is not None:
+                callback, self.on_move = self.on_move, None
+                callback()
+        return handle
+
+    def query(self, keys, request_id=None):
+        remote = super().query(keys, request_id)
+        return [
+            (_QueryStatus.HIT, None) if key in self.storage else verdict
+            for key, verdict in zip(keys, remote)
+        ]
+
+    def evict_unclaimed(self):
+        for key in set(self.storage) - set(self.claims.values()):
+            del self.storage[key]
+
+    def release(self, handles):
+        released = [
+            (handle, self.claims.pop(handle, None) is not None) for handle in handles
+        ]
+        for key in self.pending_removal - set(self.claims.values()):
+            self.storage.pop(key, None)
+        self.pending_removal.intersection_update(self.claims.values())
         return released
 
 
@@ -911,6 +1035,657 @@ class TestKVCRStorage(CustomTestCase):
         for name, pool in destination_pools.items():
             for prior, actual in zip(before[name], pool.buffers):
                 self.assertTrue(torch.equal(prior, actual))
+
+    def _move_fixture(self, enabled=True, trailing=False, publish=False, retain=False):
+        config = copy.copy(self.config)
+        config.extra_config = {
+            "enable_move_hint": enabled,
+            "retain_hinted_reads": retain,
+            "publish_inventory": publish,
+            "control_advertise_host": "127.0.0.1",
+        }
+        pools = {PoolName.KV: _HostPool(), PoolName.INDEXER: _HostPool(sizes=(5,))}
+        backend = KVCRStore(config, pools[PoolName.KV])
+        backend.register_mem_host_pool_v2(pools[PoolName.INDEXER], PoolName.INDEXER)
+        if trailing:
+            pools[PoolName.MAMBA] = _HostPool(sizes=(9,))
+            backend.register_mem_host_pool_v2(pools[PoolName.MAMBA], PoolName.MAMBA)
+        backend._namespace = storage_namespace(config, backend._layouts)
+        source = _CopyTransport(backend._layouts)
+        backend._runner = source
+        for pool_index, pool in enumerate(pools.values()):
+            for part, buffer in enumerate(pool.buffers):
+                buffer.copy_(
+                    torch.arange(buffer.numel()).reshape_as(buffer)
+                    + 17 * pool_index
+                    + part
+                )
+        transfers = [
+            PoolTransfer(name, keys=self.keys, host_indices=torch.arange(8))
+            for name in pools
+        ]
+        if trailing:
+            transfers[-1] = PoolTransfer(
+                PoolName.MAMBA,
+                keys=self.keys[-1:],
+                host_indices=torch.arange(2),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        backend.batch_set_v2(transfers)
+        expected = {
+            name: [b.clone() for b in pool.buffers] for name, pool in pools.items()
+        }
+        for pool in pools.values():
+            for buffer in pool.buffers:
+                buffer.zero_()
+        transport = backend._runner = _RetainedMoveTransport(
+            backend._layouts, {"tcp://peer:32100": source.storage}
+        )
+        info = HiCacheStorageExtraInfo(
+            extra_info={
+                "kv_hints": {
+                    "protocol_version": "0.1",
+                    "actions": [
+                        {
+                            "action_type": "kv.fetch",
+                            "action_version": "1.0",
+                            "payload": {
+                                "source_control_endpoint": "tcp://peer:32100",
+                                "mode": "move",
+                                "block_hashes": [
+                                    int(key[:16], 16) for key in self.keys
+                                ],
+                            },
+                        }
+                    ],
+                }
+            }
+        )
+        if publish:
+            backend._inventory.configure(backend._namespace, ["kv", "indexer"])
+            transport.inventory = backend._inventory
+        return backend, pools, transport, transfers, info, expected
+
+    def test_move_retains_complete_pages_and_removes_source_at_tp2(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        result = backend.batch_get_v2(transfers, info)
+        self.assertEqual(result, {"kv": [True] * 4, "indexer": [True] * 4})
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertEqual(backend.batch_exists(self.keys), 4)
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+
+    def test_retained_read_timing_includes_completion_waits(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            enabled=False, retain=True
+        )
+        info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+        backend._diagnostic_telemetry = True
+        backend._control_endpoint = "tcp://receiver:32100"
+        clock = [0.0]
+        poll_completed = transport.poll_completed
+
+        def delayed_completion():
+            clock[0] += 0.025
+            return poll_completed()
+
+        transport.poll_completed = delayed_completion
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.time.perf_counter",
+                side_effect=lambda: clock[0],
+            ),
+            self.assertLogs(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store", level="INFO"
+            ) as captured,
+        ):
+            result = backend.batch_get_v2(transfers, info)
+        self.assertTrue(all(all(flags) for flags in result.values()))
+        records = [
+            json.loads(line.split("KVCR L3 operation ", 1)[1])
+            for line in captured.output
+            if "KVCR L3 operation " in line
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertGreaterEqual(records[0]["wait_ms"], 25)
+        self.assertEqual(records[0]["submit_ms"], 0)
+
+    def test_failed_indexer_copy_preserves_the_complete_source(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                backend, _, transport, transfers, info, _ = self._move_fixture()
+                source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+                if raises:
+                    transport.raise_pool = "indexer"
+                else:
+                    transport.fail_pool = "indexer"
+                # The read took copy's path; failed retention only keeps the source.
+                self.assertEqual(
+                    backend.batch_get_v2(transfers, info),
+                    {"kv": [True] * 4, "indexer": [True] * 4},
+                )
+                backend._reap_background()
+                self.assertEqual(transport.peers["tcp://peer:32100"], source)
+                transport.evict_unclaimed()
+                self.assertFalse(transport.storage)
+
+    def test_move_capacity_fallback_delivers_without_invalidating_copied_pages(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        copied_pages = set(self.keys[2:])
+        transport.reject_keys = {
+            key
+            for key in source
+            if key.split(b"#", 1)[0].decode() in copied_pages
+            and key.endswith(b"#indexer")
+        }
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        backend._reap_background()
+        self.assertEqual(
+            transport.peers["tcp://peer:32100"],
+            {
+                key: data
+                for key, data in source.items()
+                if key.split(b"#", 1)[0].decode() in copied_pages
+            },
+        )
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_hybrid_copy_fallback_blocks_scope_commit(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        transport.fail_pool = "indexer"
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4, "mamba": [True]},
+        )
+        # A later retry that can retain the missing pool cannot turn an earlier
+        # failed retention into permission to invalidate the scope.
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        transport.fail_pool = None
+        backend.batch_get_v2(transfers[1:2], info)
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        backend.release_lookup("restore-1")
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_reverse_move_before_retention_keeps_the_source(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        transport.invalidate_before_delivery = {
+            key for key in source if key.endswith(b"#kv")
+        }
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_hybrid_move_waits_for_kv_indexer_and_checkpoint_delivery(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertEqual(backend.batch_get_v2(transfers[:1], info), {"kv": [True] * 4})
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertEqual(
+            backend.batch_get_v2(transfers[1:2], info), {"indexer": [True] * 4}
+        )
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+
+    def test_mixed_hint_modes_within_one_hybrid_scope_preserve_source(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture(
+            trailing=True, retain=True
+        )
+        mapping = {key: 17 + index for index, key in enumerate(self.keys)}
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        info.extra_info["storage_key_to_event_hash"] = mapping
+        envelope = decode_kv_hints_envelope(
+            {
+                "protocol_version": "0.1",
+                "message_id": "mixed-modes",
+                "actions": [
+                    {
+                        "action_id": mode,
+                        "action_type": "kv.fetch",
+                        "action_version": "1.0",
+                        "payload": {
+                            "source_control_endpoint": "tcp://peer:32100",
+                            "block_hashes": [mapping[key] for key in keys],
+                            "mode": mode,
+                        },
+                    }
+                    for mode, keys in (
+                        ("move", self.keys[-1:]),
+                        ("copy", self.keys[:-1]),
+                    )
+                ],
+            }
+        )
+        info.extra_info["kv_hints"] = envelope
+        original_envelope = msgspec.json.encode(envelope)
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        modes = []
+        deliver = transport.deliver
+
+        def tracked_deliver(blocks, request_id=None):
+            modes.append(transport.hints[request_id]["actions"][0]["payload"]["mode"])
+            return deliver(blocks, request_id)
+
+        transport.deliver = tracked_deliver
+        for keys, indices in (
+            (self.keys[:-1], torch.arange(6)),
+            (self.keys[-1:], torch.arange(6, 8)),
+        ):
+            batch = [
+                PoolTransfer(transfer.name, keys=keys, host_indices=indices)
+                for transfer in transfers[:2]
+            ]
+            self.assertEqual(
+                backend.batch_get_v2(batch, info),
+                {"kv": [True] * len(keys), "indexer": [True] * len(keys)},
+            )
+        self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
+        self.assertEqual(modes, ["copy", "move", "move"])
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+        self.assertFalse(transport.claims)
+        self.assertEqual(set(transport.storage), set(source))
+        self.assertEqual(msgspec.json.encode(envelope), original_envelope)
+        for name, pool in pools.items():
+            count = 1 if name == PoolName.MAMBA else 4
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:count], wanted[:count]))
+
+    def test_cancelled_hybrid_move_preserves_source(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        backend.batch_get_v2(transfers[:2], info)
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_hybrid_scope_replacement_and_error_release_copied_pages(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        for _ in range(2):
+            self.assertTrue(
+                backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+            )
+            backend.batch_get_v2(transfers[:1], info)
+        transport.raise_pool = "indexer"
+        self.assertEqual(
+            backend.batch_get_v2(transfers[1:2], info), {"indexer": [True] * 4}
+        )
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+
+    def test_pressure_during_invalidation_keeps_all_destination_pools_pinned(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        backend.batch_get_v2(transfers[:2], info)
+
+        def cancel_and_apply_pressure():
+            backend.release_lookup("restore-1")
+            transport.evict_unclaimed()
+
+        transport.on_move = cancel_and_apply_pressure
+        self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertEqual(backend.batch_exists_v2(self.keys, transfers).kv_hit_pages, 4)
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_prefetch_metadata_publishes_only_retained_move_pages(self):
+        for mode, retain, count in (
+            ("copy", False, 0),
+            ("copy", True, 4),
+            ("move", False, 4),
+        ):
+            with self.subTest(mode=mode, retain=retain):
+                backend, _, transport, transfers, info, _ = self._move_fixture(
+                    publish=True, retain=retain
+                )
+                info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = mode
+                info.extra_info["kv_event_metadata"] = {
+                    key: BlockStored(
+                        block_hashes=[17 + i],
+                        parent_block_hash=None,
+                        token_ids=[2 * i, 2 * i + 1],
+                        block_size=2,
+                        lora_id=None,
+                    )
+                    for i, key in enumerate(self.keys)
+                }
+                backend.batch_get_v2(transfers, info)
+                backend._reap_background()
+                events = backend.take_kv_events()
+                self.assertEqual(len(events), count)
+                self.assertTrue(all(event.ownership == "kvcr" for event in events))
+
+    def test_move_rejects_shared_mla_before_io(self):
+        for option, message in (
+            ("enable_move_hint", "move hints do not support shared MLA"),
+            ("retain_hinted_reads", "retained reads do not support shared MLA"),
+        ):
+            with self.subTest(option=option):
+                config = copy.copy(self.config)
+                config.is_mla_model = True
+                config.extra_config = {option: True, "share_replicated_mla": True}
+                with self.assertRaisesRegex(ValueError, message):
+                    KVCRStore(config, self.pool)
+
+    def test_move_hint_without_opt_in_never_reads_the_peer(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(enabled=False)
+        result = backend.batch_get_v2(transfers, info)
+        self.assertEqual(result, {"kv": [False] * 4, "indexer": [False] * 4})
+        self.assertEqual(backend.batch_exists(self.keys), 0)
+        self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
+
+    def test_retained_copy_keeps_both_copies_and_releases_its_claims(self):
+        for retain in (False, True):
+            with self.subTest(retain=retain):
+                backend, pools, transport, transfers, info, expected = (
+                    self._move_fixture(enabled=False, retain=retain)
+                )
+                info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+                self.assertEqual(
+                    backend.batch_get_v2(transfers, info),
+                    {"kv": [True] * 4, "indexer": [True] * 4},
+                )
+                backend._reap_background()
+                self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
+                self.assertFalse(transport.moves)
+                self.assertFalse(transport.claims)
+                self.assertEqual(len(transport.storage), 8 if retain else 0)
+                for name, pool in pools.items():
+                    for actual, wanted in zip(pool.buffers, expected[name]):
+                        self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+
+    def test_retained_read_takes_the_copy_path_and_retains_in_the_background(self):
+        """The read is one hinted copy delivery; retention follows, unawaited."""
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            enabled=False, retain=True
+        )
+        info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+        transport.hold_follows = True
+        calls = []
+        fetch, deliver = transport.fetch, transport.deliver
+
+        def tracked_fetch(keys, request_id=None, expected_layout=None, **kwargs):
+            calls.append(("fetch", request_id, kwargs.get("source_endpoint")))
+            return fetch(keys, request_id, expected_layout, **kwargs)
+
+        def tracked_deliver(blocks, request_id=None):
+            calls.append(("deliver", request_id is not None))
+            return deliver(blocks, request_id)
+
+        transport.fetch, transport.deliver = tracked_fetch, tracked_deliver
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(calls[0], ("deliver", True))
+        self.assertEqual(calls, [("deliver", True)])
+        self.assertFalse(transport.held)
+        self.assertFalse(transport.claims)
+        backend._reap_background()
+        self.assertEqual(calls[1:], [("fetch", None, "tcp://peer:32100")] * 2)
+        # The read returned while both retention fetches are still in flight.
+        self.assertEqual(len(transport.held), 2)
+        self.assertTrue(transport.claims)
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertFalse(transport.claims)
+        self.assertEqual(len(transport.storage), 8)
+        self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
+
+    def test_move_keeps_the_source_until_retention_lands(self):
+        """Neither invalidation nor a destination Stored event precedes the
+        background fetch; the event metadata outlives the read until then."""
+        backend, _, transport, transfers, info, _ = self._move_fixture(publish=True)
+        info.extra_info["kv_event_metadata"] = {
+            key: BlockStored(
+                block_hashes=[17 + i],
+                parent_block_hash=None,
+                token_ids=[2 * i, 2 * i + 1],
+                block_size=2,
+                lora_id=None,
+            )
+            for i, key in enumerate(self.keys)
+        }
+        transport.hold_follows = True
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+        self.assertFalse(backend.take_kv_events())
+        backend._reap_background()
+        self.assertFalse(backend.take_kv_events())
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertEqual(len(backend.take_kv_events()), 4)
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertFalse(transport.claims)
+
+    def test_hybrid_move_released_before_retention_keeps_the_checkpoint_pinned(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        transport.hold_follows = True
+        backend.batch_get_v2(transfers, info)
+        backend.release_lookup("restore-1")
+        # Pressure while retention is in flight must not take the checkpoint
+        # the source is about to be asked to drop.
+        transport.evict_unclaimed()
+        self.assertTrue(any(key.endswith(b"#mamba") for key in transport.storage))
+        self.assertTrue(transport.peers["tcp://peer:32100"])
+        backend._reap_background()
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertEqual(backend.batch_exists_v2(self.keys, transfers).kv_hit_pages, 4)
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_hybrid_retention_queues_until_release_and_keeps_checkpoint_pinned(self):
+        for move in (False, True):
+            with self.subTest(move=move):
+                backend, _, transport, transfers, info, _ = self._move_fixture(
+                    trailing=True, retain=True, publish=True
+                )
+                info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = (
+                    "move" if move else "copy"
+                )
+                info.extra_info["storage_lookup_scope"] = "restore-1"
+                self.assertTrue(
+                    backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+                )
+                transport.hold_follows = True
+                calls = []
+                fetch = transport.fetch
+
+                def tracked_fetch(*args, **kwargs):
+                    calls.append(kwargs.get("source_endpoint"))
+                    return fetch(*args, **kwargs)
+
+                transport.fetch = tracked_fetch
+                backend.batch_get_v2(transfers, info)
+                state = backend._move_scopes["restore-1"]
+                self.assertEqual(state.queued, 3)
+                self.assertFalse(state.pending)
+                self.assertEqual(len(state.registrations), 1)
+                backend._reap_background()
+                self.assertFalse(calls)
+                backend.release_lookup("restore-1")
+                self.assertTrue(state.claims)
+                self.assertEqual(state.queued, 3)
+                transport.evict_unclaimed()
+                self.assertTrue(
+                    any(key.endswith(b"#mamba") for key in transport.storage)
+                )
+                backend._reap_background()
+                self.assertEqual(calls, ["tcp://peer:32100"] * 3)
+                self.assertFalse(state.queued)
+                self.assertEqual(len(state.pending), 3)
+                transport.finish_follows()
+                backend._reap_background()
+                self.assertTrue(state.settled)
+                self.assertFalse(state.claims)
+                self.assertFalse(state.registrations)
+                self.assertEqual(
+                    len(transport.peers["tcp://peer:32100"]), 0 if move else 9
+                )
+
+    def test_close_cancels_queued_hybrid_retention_and_releases_claims(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            trailing=True, publish=True
+        )
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        info.extra_info["kv_event_metadata"] = {
+            key: BlockStored(
+                block_hashes=[17 + i],
+                parent_block_hash=None,
+                token_ids=[2 * i, 2 * i + 1],
+                block_size=2,
+                lora_id=None,
+            )
+            for i, key in enumerate(self.keys)
+        }
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        backend.batch_get_v2(transfers, info)
+        state = backend._move_scopes["restore-1"]
+        self.assertEqual(state.queued, 3)
+        self.assertTrue(transport.claims)
+        self.assertTrue(backend._inventory._pending)
+        with (
+            patch.object(transport, "fetch", wraps=transport.fetch) as fetch,
+            patch.object(transport, "close", create=True) as close,
+        ):
+            backend.close()
+        fetch.assert_not_called()
+        close.assert_called_once_with()
+        self.assertFalse(backend._follow_queue)
+        self.assertFalse(transport.claims)
+        self.assertFalse(backend._lookup_claims)
+        self.assertFalse(backend._inventory._pending)
+        self.assertFalse(state.registrations)
+        self.assertTrue(state.settled)
+        self.assertTrue(state.failed)
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+
+    def test_foreground_wait_does_not_submit_or_settle_retention(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        backend.batch_get_v2(transfers, info)
+        self.assertTrue(backend._follow_queue)
+        with (
+            patch.object(backend, "_submit_follows_locked") as submit,
+            patch.object(backend, "_reap_background_locked") as reap,
+        ):
+            backend.batch_get_v2(transfers, info)
+        submit.assert_not_called()
+        reap.assert_not_called()
+        self.assertFalse(transport.moves)
+        backend._reap_background()
+        self.assertFalse(transport.claims)
+
+    def test_move_invalidates_through_the_named_source_without_waiting(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        withheld, polls = {}, {"count": 0}
+        fetch, poll = transport.fetch, transport.poll_completed
+
+        def withhold_moves(keys, request_id=None, expected_layout=None, **kwargs):
+            handle = fetch(keys, request_id, expected_layout, **kwargs)
+            if kwargs.get("move"):
+                withheld[handle] = transport.completed.pop(handle)
+            return handle
+
+        def poll_or_force():
+            polls["count"] += 1
+            if polls["count"] > 1000 and withheld:
+                # Only an adapter that waits on the invalidation reaches here.
+                polls["forced"] = True
+                transport.completed.update(withheld)
+                withheld.clear()
+            return poll()
+
+        transport.fetch = withhold_moves
+        transport.poll_completed = poll_or_force
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        backend._reap_background()
+        self.assertNotIn("forced", polls)
+        self.assertEqual(
+            [(source, request_id) for source, _, request_id in transport.moves],
+            [("tcp://peer:32100", None)] * 2,
+        )
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertTrue(transport.claims)
+        transport.completed.update(withheld)
+        backend._reap_background()
+        self.assertFalse(transport.claims)
+        self.assertEqual(backend.batch_exists(self.keys), 4)
 
     def test_advisory_mamba_hint_requires_source_checkpoint_and_held_copy(self):
         """A logical-page hint must not admit absent Mamba, and a confirmed
